@@ -509,6 +509,189 @@ class CopySnapshot(BaseAction):
                 "Cross region copy complete %s", ",".join(copy_ids))
 
 
+@resources.register('ebs-fast-snapshot-restore')
+class FastSnapshotRestore(QueryResourceManager):
+
+    class resource_type(TypeInfo):
+        service = 'ec2'
+        arn_type = 'snapshot'
+        enum_spec = (
+            'describe_fast_snapshot_restores', 'FastSnapshotRestores', None)
+        id = 'SnapshotId'
+        filter_name = 'SnapshotIds'
+        filter_type = 'list'
+        name = 'SnapshotId'
+        date = 'EnabledTime'
+
+        default_report_fields = (
+            'SnapshotId',
+            'AvailabilityZone',
+            'EnablingTime',
+            'OptimizingTime',
+            'EnabledTime',
+            'State',
+        )
+
+    def resources(self, query=None):
+        qfilters = SnapshotFastRestoreQueryParser.parse(self.data.get('query', []))
+        query = query or {}
+        if qfilters:
+            query['Filters'] = qfilters
+        if query.get('OwnerIds') is None:
+            query['OwnerIds'] = ['self']
+        return super(FastSnapshotRestore, self).resources(query=query)
+
+    def get_resources(self, ids, cache=True, augment=True):
+        if cache:
+            resources = self._get_cached_resources(ids)
+            if resources is not None:
+                return resources
+        while ids:
+            try:
+                return self.source.get_resources(ids)
+            except ClientError as e:
+                bad_snap = ErrorHandler.extract_bad_snapshot(e)
+                if bad_snap:
+                    ids.remove(bad_snap)
+                    continue
+                raise
+        return []
+
+class SnapshotFastRestoreQueryParser(QueryParser):
+
+    QuerySchema = {
+        'availability-zone': six.string_types,
+        'owner-id': six.string_types,
+        'snapshot-id': six.string_types,
+        'enabling-time': six.string_types,
+        'optimizing-time': six.string_types,
+        'enabled-time': six.string_types,
+        'status': ('enabling', 'optimizing', 'enabled', 'disabling', 'disabled')
+        
+    }
+
+    type_name = 'EBS'
+
+@FastSnapshotRestore.filter_registry.register('age')
+class SnapshotAge(AgeFilter):
+    """EBS Snapshot Age Filter
+
+    Filters an EBS Fast Snapshot Restore based on the age of its enablement
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: ebs-fast-snapshot-restores-week-old
+                resource: ebs-fast-snapshot-restore
+                filters:
+                  - type: age
+                    days: 7
+                    op: ge
+    """
+
+    schema = type_schema(
+        'age',
+        days={'type': 'number'},
+        op={'$ref': '#/definitions/filters_common/comparison_operators'})
+    date_attribute = 'EnabledTime'
+
+# @FastSnapshotRestore.filter_registry.register('availability-zone')
+# class SnapshotAge(AgeFilter):
+#     """EBS Fasts Snapshot Restore Availability-Zone Filter
+
+#     Filters an Fast-Snapshot-Restore based on the availability-zone
+
+#     :example:
+
+#     .. code-block:: yaml
+
+#             policies:
+#               - name: ebs-snapshots-week-old
+#                 resource: ebs-fast-snapshot-restore
+#                 filters:
+#                   - type: age
+#                     days: 7
+#                     op: ge
+#     """
+
+#     schema = type_schema(
+#         'age',
+#         days={'type': 'number'},
+#         op={'$ref': '#/definitions/filters_common/comparison_operators'})
+#     date_attribute = 'EnabledTime'
+
+
+@FastSnapshotRestore.action_registry.register('disable')
+class FastSnapshotRestoreDisable(BaseAction):
+    """Disable EBS Fast Snapshot Restore
+
+    :example:
+
+    .. code-block:: yaml
+
+            policies:
+              - name: disable-stale-snapshots
+                resource: ebs-fast-snapshot-restore
+                filters:
+                  - type: age
+                    days: 7
+                    op: ge
+                actions:
+                  - disable
+    """
+
+    schema = type_schema('disable')
+    permissions = ('ec2:DisableFastSnapshotRestores',)
+
+    def process(self, snapshots):
+        self.image_snapshots = set()
+        log.info("Disabling %d fast snapshot restoress.",len(snapshots))
+
+        client = local_session(self.manager.session_factory).client('ec2')
+        with self.executor_factory(max_workers=2) as w:
+            futures = []
+            for snapshot_set in chunks(reversed(snapshots), size=50):
+                futures.append(
+                    w.submit(self.process_snapshot_set, client, snapshot_set))
+            for f in as_completed(futures):
+                if f.exception():
+                    self.log.error(
+                        "Exception disabling fast snapshot restore set \n %s" % (
+                            f.exception()))
+        return snapshots
+
+    def process_snapshot_set(self, client, snapshots_set):
+        retry = get_retry((
+            'RequestLimitExceeded', 'Client.RequestLimitExceeded'))
+
+        for s in snapshots_set:
+            if s['SnapshotId'] in self.image_snapshots:
+                continue
+            try:
+                retry(client.disable_fast_snapshot_restores,
+                      SnapshotId=s['SnapshotId'],
+                      AvailabilityZones=s['AvailabilityZone'],
+                      DryRun=self.manager.config.dryrun)
+            except ClientError as e:
+                if e.response['Error']['Code'] == "InvalidFastSnapshotRestore.NotFound":
+                    continue
+                raise
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @resources.register('ebs')
 class EBS(QueryResourceManager):
 
